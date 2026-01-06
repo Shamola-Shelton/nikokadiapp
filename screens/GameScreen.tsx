@@ -22,7 +22,7 @@ interface GameScreenProps {
 
 const GameScreen: React.FC<GameScreenProps> = ({ navigation, route }) => {
   const theme = useTheme();
-  const gameEngine = new GameEngine();
+  const gameEngine = GameEngine.getInstance();
   
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [selectedCards, setSelectedCards] = useState<Card[]>([]);
@@ -36,6 +36,7 @@ const GameScreen: React.FC<GameScreenProps> = ({ navigation, route }) => {
 
   const aiTurnInProgressRef = useRef(false);
   const humanPlayerIdRef = useRef<string | null>(null);
+  const aceDialogShownRef = useRef(false);
 
   const humanPlayer = gameState && humanPlayerIdRef.current
     ? gameState.players.find(p => p.id === humanPlayerIdRef.current) || null
@@ -44,20 +45,29 @@ const GameScreen: React.FC<GameScreenProps> = ({ navigation, route }) => {
   const isHumanTurn = !!(gameState && humanPlayer && gameState.players[gameState.currentPlayerIndex]?.id === humanPlayer.id);
 
   // Get playable cards for the human player
-  const playableCards = isHumanTurn && humanPlayer ? gameEngine.getValidCards(humanPlayer.hand) : [];
+  const playableCards = isHumanTurn && humanPlayer && gameState ? gameEngine.getValidCards(humanPlayer.hand) : [];
   const playableCardIdSet = new Set(playableCards.map((c: Card) => c.id));
   
+  // Always include Ace cards as playable (Ace can always be played)
+  if (isHumanTurn && humanPlayer) {
+    humanPlayer.hand.forEach(card => {
+      if (card.rank === 'A') {
+        playableCardIdSet.add(card.id);
+      }
+    });
+  }
+  
   // Get valid multi-card combinations
-  const validMultiCardCombinations = isHumanTurn && humanPlayer ? gameEngine.getValidMultiCardCombinations(humanPlayer.id) : [];
+  const validMultiCardCombinations = isHumanTurn && humanPlayer && gameState ? gameEngine.getValidMultiCardCombinations(humanPlayer.id) : [];
   const multiCardCombinationIds = new Set(validMultiCardCombinations.flat().map((c: Card) => c.id));
   
   // Get cards that can be added to current selection
-  const cardsThatCanBeAdded = isHumanTurn && humanPlayer ? gameEngine.getCardsThatCanBeAdded(humanPlayer.id, selectedCards) : [];
+  const cardsThatCanBeAdded = isHumanTurn && humanPlayer && gameState ? gameEngine.getCardsThatCanBeAdded(humanPlayer.id, selectedCards) : [];
   const addableCardIds = new Set(cardsThatCanBeAdded.map((c: Card) => c.id));
   
   // Check if current selection forms a valid multi-card combination
-  const isValidMultiCardSelection = selectedCards.length > 1 && 
-    gameEngine.isValidMultiCardCombination(humanPlayer?.id || '', selectedCards.map(c => c.id));
+  const isValidMultiCardSelection = selectedCards.length > 1 && humanPlayer &&
+    gameEngine.isValidMultiCardCombination(humanPlayer.id, selectedCards.map(c => c.id));
 
   useEffect(() => {
     if (currentPlayer?.isAI && !aiTurnInProgressRef.current && !gameOver) {
@@ -182,7 +192,7 @@ const GameScreen: React.FC<GameScreenProps> = ({ navigation, route }) => {
         const firstCard = selectedCards[0];
         const firstCardIsQuestion = firstCard.rank === '8' || firstCard.rank === 'Q';
         const currentCardIsQuestion = card.rank === '8' || card.rank === 'Q';
-        const currentCardIsAnswer = card.type === 'answer' && card.rank !== '8' && card.rank !== 'Q';
+        const currentCardIsAnswer = card.type === 'Answer' && card.rank !== '8' && card.rank !== 'Q';
         
         if (firstCardIsQuestion && currentCardIsAnswer) {
           const testSelection = [...selectedCards, card];
@@ -206,16 +216,51 @@ const GameScreen: React.FC<GameScreenProps> = ({ navigation, route }) => {
   };
 
   const executePlay = async (cardIds: string[], suit?: Suit) => {
-    if (!humanPlayer) {
-      console.log('executePlay: No human player');
+    // Get fresh game state and player reference
+    const currentGameState = gameEngine.getGameState();
+    if (!currentGameState) {
+      console.error('executePlay: No game state');
+      Alert.alert('Error', 'Game state not found');
       return;
     }
 
+    const currentHumanPlayer = currentGameState.players.find(p => p.id === humanPlayerIdRef.current);
+    if (!currentHumanPlayer) {
+      console.error('executePlay: No human player found');
+      Alert.alert('Error', 'Player not found');
+      return;
+    }
+
+    // Verify all cards are still in the player's hand
+    const cardsInHand = cardIds.every(id => currentHumanPlayer.hand.some(c => c.id === id));
+    if (!cardsInHand) {
+      console.error('executePlay: One or more cards not in hand', { cardIds, hand: currentHumanPlayer.hand.map(c => c.id) });
+      Alert.alert('Error', 'Selected cards are no longer in your hand. Please reselect.');
+      setSelectedCards([]);
+      return;
+    }
+
+    // Get the actual cards being played
+    const cardsToPlay = cardIds.map(id => currentHumanPlayer.hand.find(c => c.id === id)).filter(Boolean) as Card[];
+    const hasAce = cardsToPlay.some(c => c.rank === 'A');
+    
+    console.log('executePlay: Cards to play:', cardsToPlay.map(c => `${c.rank}${c.suit}`));
+    console.log('executePlay: Has Ace:', hasAce);
+    console.log('executePlay: Declared suit:', suit);
+
     try {
-      console.log('executePlay: Starting execution - cardIds=', cardIds, 'suit=', suit, 'humanPlayer.id=', humanPlayer.id);
+      console.log('executePlay: Starting execution - cardIds=', cardIds, 'suit=', suit, 'playerId=', currentHumanPlayer.id);
       
-      const move = gameEngine.playCard(humanPlayer.id, cardIds, suit);
-      console.log('executePlay: Game engine playCard completed, move=', move);
+      // Validate the move first (especially important for Ace cards)
+      const validation = gameEngine.validateMove(currentHumanPlayer.id, cardIds);
+      console.log('executePlay: Validation result:', validation);
+      
+      if (!validation.valid) {
+        throw new Error(validation.error || 'Invalid move');
+      }
+      
+      const move = gameEngine.playCards(currentHumanPlayer.id, cardIds, suit);
+      console.log('executePlay: Game engine playCards completed, move=', move);
 
       const updatedState = gameEngine.getGameState();
       console.log('executePlay: Got updated state, status=', updatedState?.status);
@@ -226,7 +271,8 @@ const GameScreen: React.FC<GameScreenProps> = ({ navigation, route }) => {
         setTopCard(gameEngine.getTopCard());
         setCurrentPlayer(updatedState.players[updatedState.currentPlayerIndex]);
 
-        if (updatedState.nikoDeclaredBy === humanPlayer.id) {
+        const updatedHumanPlayer = updatedState.players.find(p => p.id === humanPlayerIdRef.current);
+        if (updatedHumanPlayer && updatedState.nikoDeclaredBy === updatedHumanPlayer.id) {
           setNikoDeclared(true);
         }
 
@@ -238,25 +284,55 @@ const GameScreen: React.FC<GameScreenProps> = ({ navigation, route }) => {
       }
 
       setSelectedCards([]);
+      aceDialogShownRef.current = false; // Reset dialog flag on success
       console.log('executePlay: Successfully completed');
     } catch (error) {
       console.error('executePlay: Failed to play cards:', error);
+      aceDialogShownRef.current = false; // Reset dialog flag on error
       const message = error instanceof Error ? error.message : 'Illegal move';
       Alert.alert('Illegal Move', message);
+      // Clear selection on error
+      setSelectedCards([]);
     }
   };
 
   const handlePlayCards = async () => {
-    if (!humanPlayer || !isHumanTurn || selectedCards.length === 0) return;
+    if (!humanPlayer || !isHumanTurn || selectedCards.length === 0 || aceDialogShownRef.current) {
+      console.log('handlePlayCards: Early return', { humanPlayer: !!humanPlayer, isHumanTurn, selectedCardsLength: selectedCards.length, dialogShown: aceDialogShownRef.current });
+      return;
+    }
 
     try {
+      // Capture cardIds and selectedCards at the time of click to avoid stale closures
       const cardIds = selectedCards.map(c => c.id);
+      const cardsToPlay = [...selectedCards]; // Create a copy to avoid stale references
       const hasAce = selectedCards.some(c => c.rank === 'A');
 
-      console.log('handlePlayCards: cardIds=', cardIds, 'hasAce=', hasAce);
+      console.log('handlePlayCards: cardIds=', cardIds, 'hasAce=', hasAce, 'selectedCards=', selectedCards);
 
       if (hasAce) {
-        console.log('Showing Ace suit selection dialog');
+        console.log('Showing Ace suit selection dialog with cardIds=', cardIds);
+        aceDialogShownRef.current = true;
+        
+        // Store the card IDs in a ref or closure to ensure they're available when suit is selected
+        const aceCardIds = cardIds.slice(); // Create a copy of the array
+        
+        const handleSuitSelection = (suit: Suit) => {
+          console.log(`SUIT SELECTED: ${suit}, aceCardIds=`, aceCardIds);
+          aceDialogShownRef.current = false;
+          // Use requestAnimationFrame to ensure UI is updated
+          requestAnimationFrame(() => {
+            executePlay(aceCardIds, suit);
+          });
+        };
+        
+        const handleCancel = () => {
+          console.log('Cancel pressed');
+          aceDialogShownRef.current = false;
+          setSelectedCards([]);
+        };
+        
+        // Show Alert immediately without setTimeout
         Alert.alert(
           'Choose Suit',
           'You played an Ace! Choose the suit the next player must follow:',
@@ -264,42 +340,45 @@ const GameScreen: React.FC<GameScreenProps> = ({ navigation, route }) => {
             { 
               text: '♥ Hearts', 
               onPress: () => {
-                console.log('Hearts onPress triggered');
-                executePlay(cardIds, 'hearts');
-              } 
+                console.log('Hearts button pressed');
+                handleSuitSelection('hearts');
+              }
             },
             { 
               text: '♦ Diamonds', 
               onPress: () => {
-                console.log('Diamonds onPress triggered');
-                executePlay(cardIds, 'diamonds');
-              } 
+                console.log('Diamonds button pressed');
+                handleSuitSelection('diamonds');
+              }
             },
             { 
               text: '♣ Clubs', 
               onPress: () => {
-                console.log('Clubs onPress triggered');
-                executePlay(cardIds, 'clubs');
-              } 
+                console.log('Clubs button pressed');
+                handleSuitSelection('clubs');
+              }
             },
             { 
               text: '♠ Spades', 
               onPress: () => {
-                console.log('Spades onPress triggered');
-                executePlay(cardIds, 'spades');
-              } 
+                console.log('Spades button pressed');
+                handleSuitSelection('spades');
+              }
             },
             { 
               text: 'Cancel', 
               style: 'cancel', 
               onPress: () => {
-                console.log('Cancel pressed');
-                setSelectedCards([]);
+                console.log('Cancel button pressed');
+                handleCancel();
               }
             }
-          ]
+          ],
+          { 
+            cancelable: false
+          }
         );
-        console.log('Alert shown');
+        console.log('Alert shown for Ace card');
         return;
       }
 
@@ -313,10 +392,32 @@ const GameScreen: React.FC<GameScreenProps> = ({ navigation, route }) => {
   };
 
   const handleDrawCard = async () => {
-    if (!humanPlayer || !isHumanTurn) return;
+    // Get fresh game state and player reference
+    const currentGameState = gameEngine.getGameState();
+    if (!currentGameState) {
+      console.error('handleDrawCard: No game state');
+      Alert.alert('Error', 'Game state not found');
+      return;
+    }
+
+    const currentHumanPlayer = currentGameState.players.find(p => p.id === humanPlayerIdRef.current);
+    if (!currentHumanPlayer) {
+      console.error('handleDrawCard: No human player found');
+      Alert.alert('Error', 'Player not found');
+      return;
+    }
+
+    // Check if it's the player's turn
+    if (currentGameState.players[currentGameState.currentPlayerIndex].id !== currentHumanPlayer.id) {
+      console.error('handleDrawCard: Not player\'s turn');
+      Alert.alert('Error', 'Not your turn');
+      return;
+    }
 
     try {
-      gameEngine.drawCard(humanPlayer.id);
+      console.log('handleDrawCard: Drawing card for player', currentHumanPlayer.id);
+      const move = gameEngine.drawCard(currentHumanPlayer.id);
+      console.log('handleDrawCard: Draw completed, move=', move);
       
       const updatedState = gameEngine.getGameState();
       if (updatedState) {
@@ -331,8 +432,9 @@ const GameScreen: React.FC<GameScreenProps> = ({ navigation, route }) => {
         }
       }
 
+      console.log('handleDrawCard: Successfully completed');
     } catch (error) {
-      console.error('Failed to draw card:', error);
+      console.error('handleDrawCard: Failed to draw card:', error);
       const message = error instanceof Error ? error.message : 'Illegal move';
       Alert.alert('Illegal Move', message);
     }
@@ -620,11 +722,11 @@ const GameScreen: React.FC<GameScreenProps> = ({ navigation, route }) => {
               style={[
                 styles.actionButton,
                 styles.playButton,
-                (!isHumanTurn || selectedCards.length === 0) && styles.disabledButton,
+                (!isHumanTurn || selectedCards.length === 0 || aceDialogShownRef.current) && styles.disabledButton,
                 isValidMultiCardSelection && styles.validMultiCardButton
               ]}
               onPress={handlePlayCards}
-              disabled={!isHumanTurn || selectedCards.length === 0 || gameOver}
+              disabled={!isHumanTurn || selectedCards.length === 0 || gameOver || aceDialogShownRef.current}
             >
               <Ionicons name="play" size={20} color="white" />
               <Text style={styles.actionButtonText}>
